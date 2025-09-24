@@ -6,11 +6,30 @@ import hashlib
 import os
 import re
 import time
-from typing import Dict, List, Optional
+from itertools import cycle
+from typing import Dict, Iterable, List, Optional, Sequence
 
-from .schemas import EDU, Lang, Relation, RoleChunk, RSTResult, Span, ValidationError
+from .schemas import (
+    EDU,
+    Lang,
+    Relation,
+    RoleChunk,
+    RSTResult,
+    Span,
+    Tree,
+    ValidationError,
+    ALLOWED_RELATIONS,
+)
 
 MODEL_NAME = os.getenv("OPENAI_MODEL", "mock-gpt-rst")
+
+LANGUAGE_MARKERS: Dict[Lang, Sequence[str]] = {
+    "es": (" el ", " la ", " de ", " que ", " los ", "las ", "ñ", "¿", "¡"),
+    "en": (" the ", " and ", " of ", " to ", "ing ", "tion"),
+    "auto": (),
+}
+
+EXTENDED_RELATION_ROTATION: Sequence[str] = tuple(ALLOWED_RELATIONS)
 
 
 def _short_hash(text: str) -> str:
@@ -22,79 +41,90 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _detect_language(text: str, hint: Optional[str]) -> Lang:
-    if hint and hint != "auto":
+    if hint in ("es", "en"):
         return hint  # type: ignore[return-value]
-    lowered = text.lower()
-    spanish_markers = {" el ", " la ", " de ", " que ", " los ", "ñ", "¿", "¡"}
-    for marker in spanish_markers:
+    lowered = f" {text.lower()} "
+    for marker in LANGUAGE_MARKERS["es"]:
         if marker.strip() in {"ñ", "¿", "¡"}:
-            if marker in lowered:
+            if marker.strip() in lowered:
                 return "es"
         elif marker in lowered:
             return "es"
     return "en"
 
 
-def _split_edus(text: str) -> List[Dict]:
-    pattern = re.compile(r"(?<=[.!?])\s+|\n{2,}")
-    raw_segments = [segment.strip() for segment in pattern.split(text) if segment.strip()]
-    if not raw_segments:
-        raw_segments = [text.strip()]
+def _tokenize_sentences(text: str) -> List[str]:
+    splitter = re.compile(r"(?<=[.!?¡¿])\s+|\n{2,}")
+    pieces = [segment.strip() for segment in splitter.split(text) if segment.strip()]
+    if not pieces:
+        pieces = [text.strip()]
+    return pieces
 
-    edus: List[Dict] = []
+
+def _build_span(text: str, fragment: str, start_hint: int) -> Span:
+    window = text[start_hint:]
+    match = window.find(fragment)
+    if match == -1:
+        start = start_hint
+    else:
+        start = start_hint + match
+    end = start + len(fragment)
+    return Span(start=start, end=end)
+
+
+def _generate_edus(text: str) -> List[EDU]:
+    edus: List[EDU] = []
     cursor = 0
-    for idx, segment in enumerate(raw_segments, start=1):
-        search = re.search(re.escape(segment), text[cursor:])
-        if search is None:
-            start = cursor
-            end = start + len(segment)
-        else:
-            start = cursor + search.start()
-            end = start + len(segment)
-        cursor = end
-        edus.append(
-            EDU(
-                id=idx,
-                text=segment,
-                span=Span(start=start, end=end),
-            ).model_dump()
-        )
+    for idx, sentence in enumerate(_tokenize_sentences(text), start=1):
+        span = _build_span(text, sentence, cursor)
+        cursor = span.end
+        edus.append(EDU(id=idx, text=sentence, span=span))
     return edus
 
 
-def _build_relations(edus: List[Dict]) -> List[Dict]:
-    relations: List[Dict] = []
-    for first, second in zip(edus, edus[1:]):
-        relation = Relation(
-            type="Elaboration",
-            nucleus=RoleChunk(edu_ids=[first["id"]]),
-            satellite=RoleChunk(edu_ids=[second["id"]]),
-            confidence=0.6,
+def _relation_type_sequence(ruleset: str) -> Iterable[str]:
+    if ruleset == "minimal":
+        return cycle(["Elaboration"])
+    return cycle(EXTENDED_RELATION_ROTATION or ["Elaboration"])
+
+
+def _generate_relations(edus: List[EDU], *, ruleset: str) -> List[Relation]:
+    if len(edus) < 2:
+        return []
+    selector = _relation_type_sequence(ruleset)
+    relations: List[Relation] = []
+    for edu_a, edu_b, relation_type in zip(edus, edus[1:], selector):
+        relations.append(
+            Relation(
+                type=relation_type,
+                nucleus=RoleChunk(edu_ids=[edu_a.id]),
+                satellite=RoleChunk(edu_ids=[edu_b.id]),
+                confidence=0.6,
+            )
         )
-        relations.append(relation.model_dump())
     return relations
 
 
-def _build_brackets(edus: List[Dict]) -> str:
+def _build_brackets(edus: List[EDU], relations: List[Relation]) -> str:
     if not edus:
         return "(Summary)"
-    nodes = [f"(N {edu['id']})" for edu in edus]
+    nodes = [f"(N {edu.id})" for edu in edus]
+    relation_cycle = cycle(relations) if relations else cycle([None])
     while len(nodes) > 1:
         left = nodes.pop(0)
         right = nodes.pop(0)
-        nodes.insert(0, f"(Elaboration {left} {right})")
+        relation = next(relation_cycle)
+        rel_type = relation.type if relation else "Elaboration"
+        nodes.insert(0, f"({rel_type} {left} {right})")
     return f"(Background {nodes[0]})"
 
 
-def _build_summary(edus: List[Dict], lang: Lang) -> str:
+def _build_summary(edus: List[EDU], lang: Lang) -> str:
     if not edus:
         return ""
-    sentences = [edu["text"] for edu in edus[:2]]
+    sentences = [edu.text for edu in edus[:2]]
     summary = " ".join(sentences)
-    if lang == "es":
-        prefix = "Resumen: "
-    else:
-        prefix = "Summary: "
+    prefix = "Resumen: " if lang == "es" else "Summary: "
     return prefix + summary
 
 
@@ -111,36 +141,35 @@ def analyze_rst(
     if not raw:
         raise ValueError("El texto a analizar está vacío")
 
+    if ruleset not in {"minimal", "extended"}:
+        raise ValueError("ruleset debe ser 'minimal' o 'extended'")
+
     lang = _detect_language(raw, lang_hint)
-    edus = _split_edus(raw)
-    relations = _build_relations(edus)
-    tree_value = _build_brackets(edus)
+    edus = _generate_edus(raw)
+    relations = _generate_relations(edus, ruleset=ruleset)
+    tree_value = _build_brackets(edus, relations)
     summary = _build_summary(edus, lang)
 
-    result = {
-        "id": _short_hash(raw),
-        "lang": lang,
-        "edus": edus,
-        "relations": relations,
-        "tree": {"format": "brackets", "value": tree_value},
-        "pragmatic_summary": summary,
-        "metadata": {
+    result = RSTResult(
+        id=_short_hash(raw),
+        lang=lang,
+        edus=edus,
+        relations=relations,
+        tree=Tree(format="brackets", value=tree_value),
+        pragmatic_summary=summary,
+        metadata={
             "chars": len(raw),
             "tokens_est": _estimate_tokens(raw),
             "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "ruleset": ruleset,
             "model": model or MODEL_NAME,
         },
-    }
+    )
 
     try:
-        RSTResult.model_validate(result)
-    except ValidationError:
-        if not result["relations"]:
-            result["relations"] = []
-        if not result["tree"]:
-            result["tree"] = {"format": "brackets", "value": "(Summary (N 1))"}
-        RSTResult.model_validate(result)
+        validated = RSTResult.model_validate(result.model_dump())
+    except ValidationError as exc:
+        raise ValueError(f"Resultado RST inválido: {exc}") from exc
 
-    return result
+    return validated.model_dump()
 
