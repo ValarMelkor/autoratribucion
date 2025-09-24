@@ -1,96 +1,94 @@
-```python
+"""Herramientas para manipular representaciones de árboles RST."""
+
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+
+@dataclass
 class RSTNode:
-    """Nodo RST minimalista.
+    """Nodo ligero para árboles RST."""
 
-    Atributos:
-        label: nombre de la relación o etiqueta de hoja ("EDU:<id>")
-        role: "N" | "S" | None
-        children: lista de (role, child)
-        edu_id: entero si es hoja; None si es interno
-    """
+    label: str
+    role: Optional[str] = None
+    edu_id: Optional[int] = None
+    children: List[Tuple[Optional[str], "RSTNode"]] = field(default_factory=list)
 
-    def __init__(self, label: str, role: Optional[str] = None, edu_id: Optional[int] = None):
-        self.label = label
-        self.role = role
-        self.children: List[Tuple[Optional[str], RSTNode]] = []
-        self.edu_id = edu_id
-
-    def add(self, child: "RSTNode", role: Optional[str] = None):
+    def add(self, child: "RSTNode", role: Optional[str] = None) -> "RSTNode":
         self.children.append((role, child))
         return self
 
-    # --- Exportadores ---
     def to_brackets(self) -> str:
         if self.edu_id is not None:
-            return f"({self.role or ''} {self.edu_id})".strip()
-        inside = " ".join(
-            f"({c.role or ''} {c.to_brackets()})" if c.edu_id is None else c.to_brackets()
-            for (_, c) in self.children
-        )
-        return f"({self.label} {inside})"
+            token = f"{self.role or 'N'} {self.edu_id}".strip()
+            return f"({token})"
+        inside = []
+        for role, child in self.children:
+            if child.edu_id is None:
+                inside.append(f"({role or ''} {child.to_brackets()})".strip())
+            else:
+                inside.append(child.to_brackets())
+        joined = " ".join(inside)
+        return f"({self.label} {joined})"
 
     def to_newick(self) -> str:
         if self.edu_id is not None:
             return f"EDU{self.edu_id}"
-        inside = ",".join(c.to_newick() for (_, c) in self.children)
-        return f"({inside}){self.label}"
+        joined = ",".join(child.to_newick() for _, child in self.children)
+        return f"({joined}){self.label}"
 
-# --- Utilidades DOT ---
 
 def brackets_to_dot(brackets: str) -> str:
-    """Convierte una representación entre paréntesis a DOT (Graphviz).
-    Estrategia: parseo recursivo simple con índices, generando nodos numerados.
-    """
-    counter = {"i": 0}
-    lines = ["digraph RST {", "  node [shape=box];"]
+    """Convierte un árbol en formato brackets a un grafo DOT."""
 
-    def new_id():
+    counter = {"i": 0}
+    lines: List[str] = ["digraph RST {", "  node [shape=box];"]
+    idx = 0
+
+    def new_id() -> str:
         counter["i"] += 1
         return f"n{counter['i']}"
 
-    idx = 0
-
     def parse() -> Tuple[str, str]:
         nonlocal idx
-        assert brackets[idx] == '('
+        assert brackets[idx] == "("
         idx += 1
-        # Leer etiqueta hasta espacio o '('
-        label = []
-        while idx < len(brackets) and brackets[idx] not in [' ', '(' ,')']:
-            label.append(brackets[idx]); idx += 1
-        label = "".join(label)
+        label_chars: List[str] = []
+        while idx < len(brackets) and brackets[idx] not in " ()":
+            label_chars.append(brackets[idx])
+            idx += 1
+        label = "".join(label_chars)
         node_id = new_id()
-        lines.append(f"  {node_id} [label=\"{label}\"];\n")
-        # hijos o hoja
-        while idx < len(brackets) and brackets[idx] != ')':
-            if brackets[idx] == ' ':
-                idx += 1; continue
-            if brackets[idx] == '(':
+        lines.append(f"  {node_id} [label=\"{label}\"];")
+        while idx < len(brackets) and brackets[idx] != ")":
+            if brackets[idx].isspace():
+                idx += 1
+                continue
+            if brackets[idx] == "(":
                 child_id, _ = parse()
-                lines.append(f"  {node_id} -> {child_id};\n")
+                lines.append(f"  {node_id} -> {child_id};")
             else:
-                # token suelto (p.ej., '1' tras 'N')
-                # consumimos hasta espacio o paréntesis
-                token = []
-                while idx < len(brackets) and brackets[idx] not in [' ', ')']:
-                    token.append(brackets[idx]); idx += 1
-                # Representar token como hijo hoja
-                cid = new_id()
-                tok = "".join(token)
-                lines.append(f"  {cid} [label=\"{tok}\"];\n")
-                lines.append(f"  {node_id} -> {cid};\n")
-        idx += 1  # consume ')'
+                token_chars: List[str] = []
+                while idx < len(brackets) and brackets[idx] not in " )":
+                    token_chars.append(brackets[idx])
+                    idx += 1
+                token = "".join(token_chars)
+                child_id = new_id()
+                lines.append(f"  {child_id} [label=\"{token}\"];")
+                lines.append(f"  {node_id} -> {child_id};")
+        idx += 1
         return node_id, label
 
     while idx < len(brackets):
         if brackets[idx].isspace():
-            idx += 1; continue
-        if brackets[idx] == '(':
+            idx += 1
+            continue
+        if brackets[idx] == "(":
             parse()
         else:
             idx += 1
+
     lines.append("}")
     return "\n".join(lines)
+
